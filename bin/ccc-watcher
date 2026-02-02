@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""CCC Watcher — listens for PS + R3 combo to enter CCC mode (runs always, no grab)."""
+import subprocess
+import sys
+import time
+
+BTN_MODE   = 316  # PS button
+BTN_THUMBR = 318  # R3 (stick press)
+EV_KEY = 1
+PID_FILE = "/tmp/ccc-daemon.pid"
+
+
+def find_dualsense_pad():
+    """Find the DualSense gamepad evdev device path."""
+    import evdev
+    for path in evdev.list_devices():
+        dev = evdev.InputDevice(path)
+        name_lower = dev.name.lower()
+        if "dualsense" not in name_lower and "wireless controller" not in name_lower:
+            dev.close()
+            continue
+        caps = dev.capabilities(verbose=False)
+        if EV_KEY in caps and 304 in caps[EV_KEY]:  # BTN_SOUTH
+            dev.close()
+            return path
+        dev.close()
+    return None
+
+
+def ccc_is_running():
+    """Check if ccc-daemon is already running."""
+    try:
+        with open(PID_FILE) as f:
+            pid = int(f.read().strip())
+        # Check if process exists
+        import os
+        os.kill(pid, 0)
+        return True
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        return False
+
+
+def main():
+    import evdev
+
+    ps_held = False
+    r3_held = False
+
+    while True:
+        pad_path = find_dualsense_pad()
+        if not pad_path:
+            time.sleep(5)
+            continue
+
+        try:
+            pad = evdev.InputDevice(pad_path)
+            # No grab — passive listening
+            for event in pad.read_loop():
+                if event.type != EV_KEY:
+                    continue
+
+                if event.code == BTN_MODE:
+                    ps_held = event.value == 1
+                elif event.code == BTN_THUMBR:
+                    r3_held = event.value == 1
+
+                if ps_held and r3_held and not ccc_is_running():
+                    subprocess.Popen(["ccc-enter"])
+                    ps_held = False
+                    r3_held = False
+                    # Pause briefly — daemon will grab the device and we'll get an error,
+                    # which drops us to the reconnect loop
+                    time.sleep(1)
+
+        except (OSError, IOError):
+            # Device grabbed by ccc-daemon or disconnected — retry
+            ps_held = False
+            r3_held = False
+            time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()

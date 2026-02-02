@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Exit CCC (Claude Code Controller) mode
+if [ -f /tmp/ccc-daemon.pid ]; then
+    kill "$(cat /tmp/ccc-daemon.pid)" 2>/dev/null
+    rm -f /tmp/ccc-daemon.pid
+fi
+hyprctl dispatch submap reset
+notify-send "CCC Mode" "Disabled" -t 2000 -u low

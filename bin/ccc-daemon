@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""CCC Daemon — DualSense controller to Claude Code keybindings via evdev + ydotool."""
+import os
+import sys
+import signal
+import subprocess
+import time
+import selectors
+from pathlib import Path
+
+PID_FILE = "/tmp/ccc-daemon.pid"
+
+# ---------------------------------------------------------------------------
+# DualSense evdev button codes (from linux/input-event-codes.h)
+# ---------------------------------------------------------------------------
+BTN_SOUTH  = 304   # Cross (X)
+BTN_EAST   = 305   # Circle (O)
+BTN_NORTH  = 307   # Triangle (△)
+BTN_WEST   = 308   # Square (□)
+BTN_TL     = 310   # L1
+BTN_TR     = 311   # R1
+BTN_TL2    = 312   # L2 (digital)
+BTN_TR2    = 313   # R2 (digital)
+BTN_SELECT = 314   # Create/Share
+BTN_START  = 315   # Options
+BTN_MODE   = 316   # PS button
+BTN_THUMBL = 317   # L3 (stick press)
+BTN_THUMBR = 318   # R3 (stick press)
+
+# D-pad axes
+ABS_HAT0X  = 16
+ABS_HAT0Y  = 17
+
+# Left stick
+ABS_Y      = 1
+
+# Right stick
+ABS_RX     = 3
+ABS_RY     = 4
+
+# Touchpad multitouch
+ABS_MT_POSITION_X = 53
+ABS_MT_POSITION_Y = 54
+ABS_MT_TRACKING_ID = 57
+
+# evdev event types
+EV_KEY = 1
+EV_ABS = 3
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+STICK_DEAD_ZONE = 30       # raw units from center (128)
+STICK_CENTER    = 128
+SCROLL_INTERVAL = 0.15     # seconds between scroll ticks while stick held
+RSTICK_INTERVAL = 0.18     # seconds between arrow key repeats for right stick
+TOUCHPAD_SENSITIVITY = 0.4 # multiplier for touchpad → mouse movement
+
+# ---------------------------------------------------------------------------
+# Button → ydotool action mapping
+# ---------------------------------------------------------------------------
+def ydotool_key(codes):
+    """Build ydotool key press/release sequence string."""
+    parts = []
+    for c in codes:
+        parts.append(f"{c}:1")
+    for c in reversed(codes):
+        parts.append(f"{c}:0")
+    return parts
+
+CHEAT_SHEET_LINES = [
+    "✕ Cross        → Enter",
+    "○ Circle       → Escape",
+    "△ Triangle     → Tab",
+    "□ Square       → Shout (STT)",
+    "L1 (hold)      → Meta (Super)",
+    "R1 (hold)      → Shift",
+    "L2 (hold)      → Alt",
+    "R2             → Ctrl+Shift+V (Paste)",
+    "D-pad ↑        → z",
+    "D-pad ↓        → \"",
+    "D-pad ←        → b",
+    "D-pad →        → f",
+    "L-Stick ↕      → Scroll",
+    "R-Stick ↕      → History Up/Down",
+    "R-Stick ↔      → Cursor Left/Right",
+    "R3 (hold)      → Ctrl",
+    "Touchpad       → Mouse",
+    "Create         → Paste (Ctrl+V)",
+    "Options        → Screenshot",
+    "PS             → Exit CCC Mode (PS+R3 to re-enter)",
+    "L3 + R3        → This Cheat Sheet",
+]
+
+def show_cheat_sheet():
+    """Display the CCC cheat sheet using walker (same as Omarchy keybinding viewer)."""
+    text = "\n".join(CHEAT_SHEET_LINES)
+    proc = subprocess.Popen(
+        ["walker", "--dmenu", "-p", "CCC — Cheat Sheet", "--width", "500", "--height", "450"],
+        stdin=subprocess.PIPE,
+    )
+    proc.stdin.write(text.encode())
+    proc.stdin.close()
+
+BUTTON_MAP = {
+    BTN_SOUTH:  lambda: subprocess.Popen(["ydotool", "key"] + ydotool_key([28])),          # Enter
+    BTN_EAST:   lambda: subprocess.Popen(["ydotool", "key"] + ydotool_key([1])),            # Escape
+    BTN_NORTH:  lambda: subprocess.Popen(["ydotool", "key"] + ydotool_key([15])),           # Tab
+    BTN_WEST:   lambda: subprocess.Popen(["shout"]),                                         # STT
+    # L1/R1/L2 handled separately as modifiers (hold/release)
+    BTN_TR2:    lambda: subprocess.Popen(["ydotool", "key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]),  # Ctrl+Shift+V
+    BTN_SELECT: lambda: subprocess.Popen(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"]),  # Ctrl+V
+    BTN_START:  lambda: subprocess.Popen(["omarchy-cmd-screenshot"]),                        # Screenshot
+    BTN_MODE:   lambda: subprocess.Popen(["ccc-exit"]),                                      # Exit CCC mode
+}
+
+# D-pad keycodes (AZERTY): up=z(17), down="(4), left=b(48), right=f(33)
+DPAD_KEY = {
+    (0, -1): [17],   # Up    → z (KEY_W on AZERTY)
+    (0,  1): [4],    # Down  → " (KEY_3 on AZERTY)
+    (-1, 0): [48],   # Left  → b (KEY_B)
+    (1,  0): [33],   # Right → f (KEY_F)
+}
+
+# ---------------------------------------------------------------------------
+# Device discovery
+# ---------------------------------------------------------------------------
+def find_dualsense_devices():
+    """Find DualSense gamepad and touchpad evdev devices. Returns (pad_path, touchpad_path)."""
+    try:
+        import evdev
+    except ImportError:
+        print("ERROR: python-evdev not installed", file=sys.stderr)
+        sys.exit(1)
+
+    pad_path = None
+    touchpad_path = None
+
+    for path in evdev.list_devices():
+        dev = evdev.InputDevice(path)
+        name_lower = dev.name.lower()
+        if "dualsense" not in name_lower and "wireless controller" not in name_lower:
+            dev.close()
+            continue
+
+        caps = dev.capabilities(verbose=False)
+        abs_caps = caps.get(EV_ABS, [])
+        abs_codes = [a[0] if isinstance(a, tuple) else a for a in abs_caps]
+
+        if ABS_MT_POSITION_X in abs_codes and ABS_MT_TRACKING_ID in abs_codes:
+            touchpad_path = path
+        elif EV_KEY in caps:
+            key_caps = caps[EV_KEY]
+            if BTN_SOUTH in key_caps:
+                pad_path = path
+
+        dev.close()
+
+    return pad_path, touchpad_path
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+def main():
+    import evdev
+
+    # Write PID
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    def cleanup(sig=None, frame=None):
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+
+    pad_path, touchpad_path = find_dualsense_devices()
+
+    if not pad_path:
+        print("ERROR: DualSense gamepad not found", file=sys.stderr)
+        subprocess.run(["notify-send", "CCC Mode", "DualSense not found!", "-u", "critical"])
+        cleanup()
+
+    pad = evdev.InputDevice(pad_path)
+    pad.grab()
+
+    touchpad = None
+    if touchpad_path:
+        touchpad = evdev.InputDevice(touchpad_path)
+        touchpad.grab()
+
+    sel = selectors.DefaultSelector()
+    sel.register(pad, selectors.EVENT_READ, "pad")
+    if touchpad:
+        sel.register(touchpad, selectors.EVENT_READ, "touchpad")
+
+    # Touchpad tracking state
+    touch_last_x = None
+    touch_last_y = None
+    touch_active = False
+
+    # Left stick scroll state
+    stick_y_dir = 0  # -1 up, 0 center, 1 down
+    last_scroll_time = 0.0
+
+    # Right stick arrow state
+    rstick_x_dir = 0  # -1 left, 0 center, 1 right
+    rstick_y_dir = 0  # -1 up, 0 center, 1 down
+    last_rstick_time = 0.0
+
+    # D-pad state
+    dpad_x = 0
+    dpad_y = 0
+
+    # L3+R3 combo state
+    thumbl_held = False
+    thumbr_held = False
+
+    try:
+        while True:
+            # Handle stick-based repeats (left=scroll, right=arrows)
+            now = time.monotonic()
+            timeout = 0.1  # idle poll default
+
+            if stick_y_dir != 0:
+                remaining = SCROLL_INTERVAL - (now - last_scroll_time)
+                if remaining <= 0:
+                    scroll_val = 3 if stick_y_dir < 0 else -3
+                    subprocess.Popen(["ydotool", "mousemove", "--wheel", "--", "0", str(scroll_val)])
+                    last_scroll_time = now
+                    remaining = SCROLL_INTERVAL
+                timeout = min(timeout, remaining)
+
+            if rstick_x_dir != 0 or rstick_y_dir != 0:
+                remaining = RSTICK_INTERVAL - (now - last_rstick_time)
+                if remaining <= 0:
+                    if rstick_y_dir != 0:
+                        kc = 103 if rstick_y_dir < 0 else 108  # Up / Down
+                        subprocess.Popen(["ydotool", "key"] + ydotool_key([kc]))
+                    if rstick_x_dir != 0:
+                        kc = 105 if rstick_x_dir < 0 else 106  # Left / Right
+                        subprocess.Popen(["ydotool", "key"] + ydotool_key([kc]))
+                    last_rstick_time = now
+                    remaining = RSTICK_INTERVAL
+                timeout = min(timeout, remaining)
+
+            events = sel.select(timeout=timeout)
+
+            for key, _ in events:
+                device = key.fileobj
+                source = key.data
+
+                for event in device.read():
+                    if source == "pad":
+                        if event.type == EV_KEY:
+                            # Track L3/R3 held state for combo
+                            if event.code == BTN_THUMBL:
+                                thumbl_held = event.value == 1
+                                if thumbl_held and thumbr_held:
+                                    show_cheat_sheet()
+                                continue
+                            if event.code == BTN_THUMBR:
+                                thumbr_held = event.value == 1
+                                if thumbl_held and thumbr_held:
+                                    show_cheat_sheet()
+                                else:
+                                    subprocess.Popen(["ydotool", "key", f"29:{event.value}"])  # Ctrl
+                                continue
+
+                            # L1=Meta, R1=Shift (hold/release modifiers)
+                            if event.code == BTN_TL:
+                                subprocess.Popen(["ydotool", "key", f"125:{event.value}"])
+                                continue
+                            if event.code == BTN_TR:
+                                subprocess.Popen(["ydotool", "key", f"42:{event.value}"])
+                                continue
+                            if event.code == BTN_TL2:
+                                subprocess.Popen(["ydotool", "key", f"56:{event.value}"])
+                                continue
+
+                            if event.value == 1:  # key press
+                                action = BUTTON_MAP.get(event.code)
+                                if action:
+                                    action()
+
+                        elif event.type == EV_ABS:
+                            if event.code == ABS_HAT0X:
+                                dpad_x = event.value
+                                combo = (dpad_x, dpad_y)
+                                keys = DPAD_KEY.get(combo)
+                                if keys:
+                                    subprocess.Popen(["ydotool", "key"] + ydotool_key(keys))
+
+                            elif event.code == ABS_HAT0Y:
+                                dpad_y = event.value
+                                combo = (dpad_x, dpad_y)
+                                keys = DPAD_KEY.get(combo)
+                                if keys:
+                                    subprocess.Popen(["ydotool", "key"] + ydotool_key(keys))
+
+                            elif event.code == ABS_Y:
+                                offset = event.value - STICK_CENTER
+                                if abs(offset) > STICK_DEAD_ZONE:
+                                    new_dir = 1 if offset > 0 else -1
+                                    if new_dir != stick_y_dir:
+                                        stick_y_dir = new_dir
+                                        last_scroll_time = time.monotonic()
+                                        scroll_val = 3 if stick_y_dir < 0 else -3
+                                        subprocess.Popen(["ydotool", "mousemove", "--wheel", "--", "0", str(scroll_val)])
+                                else:
+                                    stick_y_dir = 0
+
+                            elif event.code == ABS_RY:
+                                offset = event.value - STICK_CENTER
+                                if abs(offset) > STICK_DEAD_ZONE:
+                                    new_dir = 1 if offset > 0 else -1
+                                    if new_dir != rstick_y_dir:
+                                        rstick_y_dir = new_dir
+                                        last_rstick_time = time.monotonic()
+                                        kc = 103 if rstick_y_dir < 0 else 108
+                                        subprocess.Popen(["ydotool", "key"] + ydotool_key([kc]))
+                                else:
+                                    rstick_y_dir = 0
+
+                            elif event.code == ABS_RX:
+                                offset = event.value - STICK_CENTER
+                                if abs(offset) > STICK_DEAD_ZONE:
+                                    new_dir = 1 if offset > 0 else -1
+                                    if new_dir != rstick_x_dir:
+                                        rstick_x_dir = new_dir
+                                        last_rstick_time = time.monotonic()
+                                        kc = 105 if rstick_x_dir < 0 else 106
+                                        subprocess.Popen(["ydotool", "key"] + ydotool_key([kc]))
+                                else:
+                                    rstick_x_dir = 0
+
+                    elif source == "touchpad":
+                        if event.type == EV_ABS:
+                            if event.code == ABS_MT_TRACKING_ID:
+                                if event.value == -1:
+                                    # finger lifted
+                                    touch_active = False
+                                    touch_last_x = None
+                                    touch_last_y = None
+                                else:
+                                    touch_active = True
+
+                            elif event.code == ABS_MT_POSITION_X:
+                                if touch_active and touch_last_x is not None:
+                                    dx = int((event.value - touch_last_x) * TOUCHPAD_SENSITIVITY)
+                                    if dx != 0:
+                                        subprocess.Popen(["ydotool", "mousemove", "--", str(dx), "0"])
+                                touch_last_x = event.value
+
+                            elif event.code == ABS_MT_POSITION_Y:
+                                if touch_active and touch_last_y is not None:
+                                    dy = int((event.value - touch_last_y) * TOUCHPAD_SENSITIVITY)
+                                    if dy != 0:
+                                        subprocess.Popen(["ydotool", "mousemove", "--", "0", str(dy)])
+                                touch_last_y = event.value
+
+                        elif event.type == EV_KEY:
+                            # Touchpad physical click
+                            if event.code == 272 and event.value == 1:  # BTN_LEFT
+                                subprocess.Popen(["ydotool", "click", "0xC0"])
+
+    except Exception as e:
+        print(f"CCC daemon error: {e}", file=sys.stderr)
+    finally:
+        try:
+            pad.ungrab()
+            pad.close()
+        except Exception:
+            pass
+        if touchpad:
+            try:
+                touchpad.ungrab()
+                touchpad.close()
+            except Exception:
+                pass
+        cleanup()
+
+
+if __name__ == "__main__":
+    main()

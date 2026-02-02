@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Enter CCC (Claude Code Controller) mode
+ccc-daemon &
+hyprctl dispatch submap ccc_mode
+notify-send "CCC Mode" "Enabled - Press Shift+Numpad2 to exit" -t 2000 -u low
